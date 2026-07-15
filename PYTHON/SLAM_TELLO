@@ -1,0 +1,707 @@
+import os
+
+# Must be set before any cv2.VideoCapture is opened. By default, FFmpeg
+# queues incoming frames faster than a single-threaded loop can process
+# them, so the displayed video drifts further and further behind live -
+# these flags tell it to drop stale frames instead of buffering them.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "fflags;nobuffer|flags;low_delay|framedrop;1|reorder_queue_size;0|max_delay;0"
+)
+
+import cv2
+import numpy as np
+import matplotlib
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+
+import logging
+import time
+from collections import deque
+from tkinter import TclError
+import socket
+import threading
+
+logging.basicConfig(
+    filename="tello_slam_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+TELLO_IP = "192.168.10.1"
+TELLO_CMD_PORT = 8889
+TELLO_VIDEO = "udp://0.0.0.0:11111"
+
+LOCAL_PORT = 8889  # Must match TELLO_CMD_PORT: the Tello's firmware sends
+                    # its "ok"/response packets back to UDP port 8889
+                    # specifically, not to whatever source port the command
+                    # actually came from. Binding anywhere else (e.g. 9000)
+                    # means "command" gets sent fine but the reply is never
+                    # received, causing repeated "No response" timeouts.
+                    # This matches what djitellopy does internally.
+
+sock: socket.socket | None = None
+_sock_lock = threading.Lock()
+
+_keepalive_stop = threading.Event()
+_keepalive_thread: threading.Thread | None = None
+
+def _keepalive_loop():
+
+    while not _keepalive_stop.wait(8):
+        try:
+            send_command("command", timeout=3)
+        except Exception as e:
+            logging.exception(e)
+
+def start_keepalive():
+    global _keepalive_thread
+
+    _keepalive_stop.clear()
+
+    thread = threading.Thread(target=_keepalive_loop, daemon=True)
+
+    thread.start()
+
+    _keepalive_thread = thread
+
+def stop_keepalive():
+
+    _keepalive_stop.set()
+
+    if _keepalive_thread is not None:
+        _keepalive_thread.join(timeout=2)
+
+def connect_tello(retries=3):
+    global sock
+
+    print("Connecting to TELLO...")
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", LOCAL_PORT))
+
+    sock = s
+
+    # The Tello frequently drops the very first UDP command it receives
+    # after Wi-Fi association, so a single timeout here doesn't
+    # necessarily mean anything is actually wrong - retry a few times
+    # before giving up.
+    response = None
+    for attempt in range(1, retries + 1):
+        response = send_command("command")
+        if response is not None and response.lower() == "ok":
+            break
+        logging.warning("Attempt %d/%d to enter SDK mode failed (got %r)",
+                         attempt, retries, response)
+
+    if response is None or response.lower() != "ok":
+        sock.close()
+        sock = None
+        raise RuntimeError(
+            f"TELLO did not enter SDK command mode (got {response!r}) "
+            f"after {retries} attempts. Make sure you are connected to "
+            "the TELLO's WiFi network."
+        )
+
+    battery = send_command("battery?")
+    if battery is not None:
+        print(f"Battery: {battery}%")
+    else:
+        print("Battery: unknown (no response)")
+
+    return True
+
+
+def disconnect_tello():
+    """Release the UDP socket used to talk to the TELLO."""
+    global sock
+    if sock is not None:
+        sock.close()
+        sock = None
+
+def send_command(command, timeout=5):
+    if sock is None:
+        raise RuntimeError("TELLO is not connected.")
+
+    with _sock_lock:
+
+        sock.sendto(command.encode("utf-8"), (TELLO_IP, TELLO_CMD_PORT))
+        sock.settimeout(timeout)
+
+        try:
+            response, _ = sock.recvfrom(1024)
+            response = response.decode("utf-8").strip()
+
+            logging.info("%s -> %s", command, response)
+
+            return response
+
+        except socket.timeout:
+            logging.warning("Timeout waiting for response to '%s'", command)
+            print(f"No response to '{command}'")
+            return None
+
+# --------------------------------------------------------------------
+# Manual flight control (PLACEHOLDER - fill in / extend as needed)
+# --------------------------------------------------------------------
+# These are thin wrappers around the TELLO SDK's movement commands so a
+# key press in the SLAM window can steer the drone. They're deliberately
+# simple stubs:
+#   - Each call blocks on a socket response (up to `timeout` seconds),
+#     which will stall the SLAM display loop while the drone acknowledges.
+#     For real manual flight, move this onto its own thread (or switch
+#     to the streaming "rc <lr> <fb> <ud> <yaw>" command for continuous,
+#     non-blocking control instead of discrete step commands).
+#   - No safety limits, geofencing, or debouncing are implemented yet.
+#   - Distances are in cm, must be 20-500 for step commands; speeds for
+#     "rc" must be -100 to 100.
+
+MOVE_STEP_CM = 30  # distance per keypress for step-style movement commands
+
+
+def takeoff():
+    """Placeholder: command the TELLO to take off."""
+    return send_command("takeoff", timeout=10)
+
+
+def land():
+    """Placeholder: command the TELLO to land."""
+    return send_command("land", timeout=10)
+
+
+def move(direction, distance_cm=MOVE_STEP_CM):
+    """Placeholder: step the TELLO in one direction.
+
+    direction: one of 'up', 'down', 'left', 'right', 'forward', 'back'
+    """
+    return send_command(f"{direction} {distance_cm}")
+
+
+def rotate(direction, degrees=30):
+    """Placeholder: yaw the TELLO in place.
+
+    direction: 'cw' (clockwise) or 'ccw' (counter-clockwise)
+    """
+    return send_command(f"{direction} {degrees}")
+
+
+def handle_movement_key(key):
+    """Placeholder: map a key captured from the SLAM window to a flight
+    command. Extend this mapping (or replace it with your own control
+    scheme) to actually fly the drone during a SLAM session.
+
+    Current bindings:
+        t        -> takeoff
+        l        -> land
+        w/a/s/d  -> forward/left/back/right
+        r/f      -> up/down
+        e/q      -> rotate cw/ccw   (NOTE: 'q' also quits the SLAM loop,
+                                      so this binding is illustrative only
+                                      and won't fire in practice as-is)
+    """
+    key_char = chr(key) if 0 <= key < 256 else ""
+
+    # TODO: implement/replace this dispatch with real flight logic.
+    if key_char == "t":
+        takeoff()
+    elif key_char == "l":
+        land()
+    elif key_char == "w":
+        move("forward")
+    elif key_char == "s":
+        move("back")
+    elif key_char == "a":
+        move("left")
+    elif key_char == "d":
+        move("right")
+    elif key_char == "r":
+        move("up")
+    elif key_char == "f":
+        move("down")
+    elif key_char == "e":
+        rotate("cw")
+
+
+# --------------------------------------------------------------------
+# Configuration constants
+# --------------------------------------------------------------------
+MOTION_THRESHOLD = 2.0   # min median pixel displacement before estimating pose
+MIN_INLIERS = 5          # raised slightly from 3, since 3 was too weak a majority
+                         # vote for a stable 6-DOF pose; paired with the
+                         # direction-consistency check below instead of
+                         # relying on inlier count alone.
+RANSAC_THRESHOLD = 3.0   # was implicitly 1.5 - too tight for webcam noise/blur
+MAX_DIRECTION_CHANGE_COS = 0.3   # reject a step whose direction is more than
+                                 # ~70 degrees off the recent trend (cosine
+                                 # similarity below this is rejected)
+DIRECTION_HISTORY = 5
+MAX_POINTS = 50000
+RENDER_INTERVAL = 3
+
+
+class _FrameGrabber:
+    """Reads frames from a cv2.VideoCapture on a background thread and
+    exposes only the most recent one.
+
+    A single-threaded `camera.read()` loop can only pull frames as fast as
+    the rest of the loop (ORB extraction, pose estimation, plotting) runs.
+    When that's slower than the incoming stream, FFmpeg's internal buffer
+    keeps growing, so every frame you read is older than the last - visible
+    delay increases over the session instead of staying constant. This
+    decouples capture from processing: the background thread always
+    overwrites `self.frame` with whatever just arrived, silently dropping
+    anything the main loop didn't get to in time, so `read()` is always
+    the latest frame rather than the oldest one still in the queue.
+    """
+
+    def __init__(self, capture):
+        self._capture = capture
+        self.frame = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._update, daemon=True)
+        self._thread.start()
+
+    def _update(self):
+        while not self._stop.is_set():
+            ret, frame = self._capture.read()
+            if ret:
+                with self._lock:
+                    self.frame = frame
+
+    def read(self):
+        with self._lock:
+            return self.frame
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self._capture.release()
+
+
+class WorkingEnvironmentSLAM:
+
+    def __init__(self):
+        logging.info("Initializing SLAM")
+
+        # noinspection PyUnresolvedReferences
+        self.orb = cv2.ORB_create(nfeatures=1500, scaleFactor=1.2, nlevels=8)
+        # Brute-force Hamming matching is simpler and faster than FLANN/LSH
+        # for ORB's binary descriptors at this scale, and needs no index params.
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+        self.K = np.array([
+            [833.866, 0, 320.0],
+            [0, 833.866, 240.0],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        self.pose_rotation = np.eye(3, dtype=np.float64)
+        self.pose_translation = np.zeros((3, 1), dtype=np.float64)
+        self.trajectory_x = [0.0]
+        self.trajectory_y = [0.0]
+        self.trajectory_z = [0.0]
+        self.recent_directions = deque(maxlen=DIRECTION_HISTORY)
+
+        self.points_x = []
+        self.points_y = []
+        self.points_z = []
+        self.points_colors = []
+
+        self.frame_count = 0
+        self.scatter_plot = None
+
+        self._init_plot()
+        logging.info("Initialization complete")
+
+    def _init_plot(self):
+        plt.ion()
+        # noinspection PyTypeChecker
+        self.fig = plt.figure(figsize=(10.0, 7.0))
+        self.ax = self.fig.add_subplot(111, projection="3d")
+
+        self.path_plot, = self.ax.plot(
+            [], [], [], color="red", linewidth=2,
+            marker="o", markersize=3, label="Camera Path",
+        )
+        self.ax.set_title("3D Reconstructed Environment")
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.set_zlabel("Z")
+        self.ax.legend()
+
+    # ------------------------------------------------------------------
+    # Feature matching
+    # ------------------------------------------------------------------
+
+    def extract_features_and_colors(self, img1, img2, original_bgr):
+        kp1, des1 = self.orb.detectAndCompute(img1, None)
+        kp2, des2 = self.orb.detectAndCompute(img2, None)
+
+        if des1 is None or des2 is None or len(des1) < 20 or len(des2) < 20:
+            logging.warning("Not enough descriptors to match.")
+            return None, None, None
+
+        try:
+            matches = self.matcher.knnMatch(des1, des2, k=2)
+        except cv2.error:
+            logging.exception("Matching failed.")
+            return None, None, None
+
+        height, width = original_bgr.shape[:2]
+        good_pts1, good_pts2, colors = [], [], []
+
+        for pair in matches:
+            if len(pair) != 2:
+                continue
+            m, n = pair
+
+            if m.distance >= 0.85 * n.distance:  # Lowe ratio test
+                continue
+            if m.distance > 60:                  # absolute distance cutoff
+                continue
+
+            pt1 = kp1[m.queryIdx].pt
+            pt2 = kp2[m.trainIdx].pt
+            x, y = int(round(pt2[0])), int(round(pt2[1]))
+
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+
+            b, g, r = original_bgr[y, x]
+            colors.append([r / 255.0, g / 255.0, b / 255.0])
+            good_pts1.append(pt1)
+            good_pts2.append(pt2)
+
+        if len(good_pts1) < 8:
+            logging.info("Too few good matches.")
+            return None, None, None
+
+        logging.info(
+            f"Features: {len(kp1)} -> {len(kp2)}  Good matches: {len(good_pts1)}"
+        )
+        return (
+            np.asarray(good_pts1, dtype=np.float64),
+            np.asarray(good_pts2, dtype=np.float64),
+            np.asarray(colors, dtype=np.float64),
+        )
+
+    # ------------------------------------------------------------------
+    # Pose estimation
+    # ------------------------------------------------------------------
+
+    def _estimate_relative_pose(self, pts1, pts2):
+        """Returns (rotation, translation, inlier_mask) or (None, None, None)."""
+        essential_mat, mask = cv2.findEssentialMat(
+            pts1, pts2, self.K, method=cv2.RANSAC, prob=0.999,
+            threshold=RANSAC_THRESHOLD
+        )
+        if essential_mat is None:
+            return None, None, None
+
+        _, rotation, translation, pose_mask = cv2.recoverPose(
+            essential_mat, pts1, pts2, self.K, mask=mask
+        )
+        inliers = pose_mask.ravel() > 0
+        return rotation, translation, inliers
+
+    def _direction_is_consistent(self, step_world):
+        """Compares a candidate world-frame step against the recent heading.
+
+        Returns (accepted, unit_direction). The very first accepted step
+        always passes, since there's no trend yet to compare against.
+        """
+        norm = np.linalg.norm(step_world)
+        if norm < 1e-9:
+            return False, None
+
+        direction = (step_world / norm).ravel()
+
+        if len(self.recent_directions) == 0:
+            return True, direction
+
+        mean_dir = np.mean(self.recent_directions, axis=0)
+        mean_norm = np.linalg.norm(mean_dir)
+        if mean_norm < 1e-9:
+            return True, direction
+
+        cos_sim = float(np.dot(direction, mean_dir / mean_norm))
+        return cos_sim >= MAX_DIRECTION_CHANGE_COS, direction
+
+    def _apply_pose_update(self, rotation, translation):
+        old_rotation = self.pose_rotation.copy()
+        old_translation = self.pose_translation.copy()
+
+        self.pose_translation = self.pose_translation + self.pose_rotation @ translation
+        self.pose_rotation = self.pose_rotation @ rotation
+
+        tx, ty, tz = self.pose_translation.ravel()
+        self.trajectory_x.append(float(tx))
+        self.trajectory_y.append(float(ty))
+        self.trajectory_z.append(float(tz))
+        return old_rotation, old_translation
+
+    def _triangulate_and_store(self, old_rotation, old_translation, pts1, pts2, colors, inliers):
+        pts_old, pts_new = pts1[inliers], pts2[inliers]
+        valid_colors = colors[inliers]
+
+        proj1 = self.K @ np.hstack((old_rotation, old_translation))
+        proj2 = self.K @ np.hstack((self.pose_rotation, self.pose_translation))
+
+        points_4d = cv2.triangulatePoints(proj1, proj2, pts_old.T, pts_new.T)
+        points_3d = points_4d[:3] / points_4d[3]
+
+        for i in range(points_3d.shape[1]):
+            x, y, z = points_3d[:, i]
+            if abs(x) < 50 and abs(y) < 50 and abs(z) < 50:
+                self.points_x.append(x)
+                self.points_y.append(y)
+                self.points_z.append(z)
+                self.points_colors.append(valid_colors[i])
+
+        if len(self.points_x) > MAX_POINTS:
+            self.points_x = self.points_x[-MAX_POINTS:]
+            self.points_y = self.points_y[-MAX_POINTS:]
+            self.points_z = self.points_z[-MAX_POINTS:]
+            self.points_colors = self.points_colors[-MAX_POINTS:]
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+
+    def update_plot(self):
+        try:
+            self.path_plot.set_data(
+                np.asarray(self.trajectory_x), np.asarray(self.trajectory_y)
+            )
+            # noinspection PyUnresolvedReferences
+            self.path_plot.set_3d_properties(np.asarray(self.trajectory_z))
+
+            if self.points_x:
+                step = max(1, len(self.points_x) // 2500)
+                xs = np.asarray(self.points_x[::step])
+                ys = np.asarray(self.points_y[::step])
+                zs = np.asarray(self.points_z[::step])
+                colors = np.asarray(self.points_colors[::step])
+
+                if self.scatter_plot is None:
+                    self.scatter_plot = self.ax.scatter(
+                        xs, ys, zs, c=colors, s=3, alpha=0.8
+                    )
+                else:
+                    self.scatter_plot._offsets3d = (xs, ys, zs)
+                    self.scatter_plot.set_facecolors(colors)
+
+            all_x = self.trajectory_x + self.points_x
+            all_y = self.trajectory_y + self.points_y
+            all_z = self.trajectory_z + self.points_z
+
+            if all_x:
+                margin = 2.0
+                self.ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
+                self.ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+                self.ax.set_zlim(min(all_z) - margin, max(all_z) + margin)
+
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+
+        # Catches: bad array shapes feeding set_data/scatter (ValueError),
+        # matplotlib/Tk backend hiccups (RuntimeError), and the very common
+        # case of the plot window being closed mid-update (TclError).
+        except (ValueError, RuntimeError, TclError):
+            logging.exception("Plot update failed.")
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_camera():
+        cap = cv2.VideoCapture(TELLO_VIDEO, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            logging.info("Unable to open tello video stream")
+            return None
+
+        grabber = _FrameGrabber(cap)
+
+        # Wait for the first real frames to arrive instead of a fixed
+        # cap.read() x30 flush, since the grabber now reads on its own
+        # thread as soon as it starts.
+        for _ in range(50):
+            if grabber.read() is not None:
+                break
+            time.sleep(0.05)
+
+        return grabber
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self):
+        logging.info("Starting camera.")
+        camera = self._open_camera()
+        if camera is None:
+            logging.error("Camera unavailable.")
+            return
+
+        time.sleep(1)  # allow exposure to stabilize
+        first_frame = camera.read()
+        if first_frame is None:
+            logging.error("Initial frame failed.")
+            camera.stop()
+            return
+
+        keyframe_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+
+        actual_h, actual_w = first_frame.shape[:2]
+        logging.info(f"Actual captured frame size: {actual_w}x{actual_h}")
+        if (actual_w, actual_h) != (640, 480):
+            # Rescale the intrinsics instead of just warning: fx/fy scale
+            # with resolution and cx/cy should sit at the new image
+            # center, otherwise every pose estimate downstream is biased.
+            scale_x = actual_w / 640.0
+            scale_y = actual_h / 480.0
+            self.K[0, 0] *= scale_x   # fx
+            self.K[1, 1] *= scale_y   # fy
+            self.K[0, 2] = actual_w / 2.0   # cx
+            self.K[1, 2] = actual_h / 2.0   # cy
+            print(
+                f"NOTE: camera is capturing at {actual_w}x{actual_h}, not the "
+                f"640x480 self.K was set up for. Rescaled K to compensate: "
+                f"fx={self.K[0, 0]:.1f}, fy={self.K[1, 1]:.1f}, "
+                f"cx={self.K[0, 2]:.1f}, cy={self.K[1, 2]:.1f}."
+            )
+
+        print("\n==============================")
+        print(" SLAM ACTIVE ")
+        print("==============================")
+        print("Translate the camera (move sideways/forward/back) - ")
+        print("rotating it in place alone won't move the reconstruction.")
+        print("Press Q in the camera window to stop.")
+
+        while True:
+            try:
+                frame = camera.read()
+                if frame is None:
+                    logging.warning("Frame capture failed.")
+                    continue
+
+                self.frame_count += 1
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                pts1, pts2, colors = self.extract_features_and_colors(
+                    keyframe_gray, gray, frame
+                )
+
+                status = "no match"
+                if pts1 is not None:
+                    motion = np.median(np.linalg.norm(pts2 - pts1, axis=1))
+                    status = f"motion={motion:.1f}"
+
+                    if motion > MOTION_THRESHOLD:
+                        rotation, translation, inliers = self._estimate_relative_pose(pts1, pts2)
+
+                        if inliers is not None and inliers.sum() > MIN_INLIERS:
+                            # recoverPose only gives a unit-length direction -
+                            # monocular vision can't recover true scale from
+                            # one frame pair. Scale it by the observed pixel
+                            # motion so steps are proportional to how much
+                            # the camera actually appeared to move, instead
+                            # of every accepted step jumping by a fixed size.
+                            scale = motion / self.K[0, 0]
+                            scaled_translation = translation * scale
+
+                            candidate_step = self.pose_rotation @ scaled_translation
+                            direction_ok, direction = self._direction_is_consistent(candidate_step)
+
+                            if direction_ok:
+                                old_rotation, old_translation = self._apply_pose_update(
+                                    rotation, scaled_translation
+                                )
+                                self.recent_directions.append(direction)
+                                self._triangulate_and_store(
+                                    old_rotation, old_translation, pts1, pts2, colors, inliers
+                                )
+                                keyframe_gray = gray.copy()
+                                status += f" | pose updated, inliers={inliers.sum()}"
+                                logging.info(
+                                    f"Pose {self.pose_translation.ravel().tolist()} "
+                                    f"Inliers {inliers.sum()}"
+                                )
+                            else:
+                                status += (
+                                    f" | pose rejected (direction), "
+                                    f"inliers={inliers.sum()}"
+                                )
+                        else:
+                            n_inliers = int(inliers.sum()) if inliers is not None else 0
+                            status += f" | pose rejected, inliers={n_inliers}"
+
+                # Draw tracked points + status directly on the frame instead
+                # of printing every value to the console (much cheaper, and
+                # keeps the terminal readable).
+                display = frame.copy()
+                if pts2 is not None:
+                    for p in pts2:
+                        cv2.circle(display, (int(p[0]), int(p[1])), 2, (0, 255, 255), -1)
+
+                cv2.putText(display, status, (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(display, f"Points: {len(self.points_x)}", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                cv2.imshow("SLAM Tracking", display)
+
+                if self.frame_count % RENDER_INTERVAL == 0:
+                    self.update_plot()
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key != 0xFF:
+                    # PLACEHOLDER: routes other key presses to manual
+                    # flight control. See handle_movement_key() above.
+                    handle_movement_key(key)
+
+            # Catches: OpenCV rejecting bad frame/array data (cv2.error) and
+            # numpy shape mismatches during pose math (ValueError). Anything
+            # else is a real bug and should crash with a full traceback
+            # rather than being silently logged and skipped.
+            except (cv2.error, ValueError):
+                logging.exception("SLAM loop failure")
+
+        camera.stop()
+        cv2.destroyAllWindows()
+        plt.close("all")
+        logging.info("SLAM stopped.")
+
+
+if __name__ == "__main__":
+    connect_tello()
+
+    start_keepalive()
+
+    send_command("streamoff")
+    time.sleep(1)
+
+    send_command("streamon")
+
+    # Video quality settings. These trade off against each other and
+    # against processing speed: higher resolution/fps look better but
+    # mean more pixels for ORB feature extraction to chew through every
+    # frame, which can itself add lag if the SLAM loop can't keep up.
+    # "high" resolution (720p) + "middle" fps (15) is a reasonable
+    # balance for this workload; bump fps to "high" if your machine
+    # keeps up fine, or drop resolution to "low" if it doesn't.
+    send_command("setresolution high")
+    send_command("setfps middle")
+    send_command("setbitrate 0")  # 0 = auto
+
+    time.sleep(2)
+
+    try:
+        slam = WorkingEnvironmentSLAM()
+        slam.run()
+    finally:
+        stop_keepalive()
+        send_command("streamoff")
+        disconnect_tello()
