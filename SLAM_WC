@@ -1,0 +1,413 @@
+import cv2
+import numpy as np
+import matplotlib
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+
+import logging
+import time
+from collections import deque
+from tkinter import TclError
+
+logging.basicConfig(
+    filename="slam_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+# --------------------------------------------------------------------
+# Configuration constants
+# --------------------------------------------------------------------
+MOTION_THRESHOLD = 2.0   # min median pixel displacement before estimating pose
+MIN_INLIERS = 5          # raised slightly from 3 to 3 was too weak a majority
+                         # vote for a stable 6-DOF pose; paired with the
+                         # direction-consistency check below instead of
+                         # relying on inlier count alone.
+RANSAC_THRESHOLD = 3.0   # was implicitly 1.5 - too tight for webcam noise/blur
+MAX_DIRECTION_CHANGE_COS = 0.3   # reject a step whose direction is more than
+                                 # ~70 degrees off the recent trend (cosine
+                                 # similarity below this is rejected)
+DIRECTION_HISTORY = 5
+MAX_POINTS = 50000
+RENDER_INTERVAL = 3
+
+
+class WorkingEnvironmentSLAM:
+
+    def __init__(self):
+        logging.info("Initializing SLAM")
+
+        # noinspection PyUnresolvedReferences
+        self.orb = cv2.ORB_create(nfeatures=1500, scaleFactor=1.2, nlevels=8)
+        # Brute-force Hamming matching is simpler and faster than FLANN/LSH
+        # for ORB's binary descriptors at this scale, and needs no index params.
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+        self.K = np.array([
+            [833.866, 0, 320.0],
+            [0, 833.866, 240.0],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        self.pose_rotation = np.eye(3, dtype=np.float64)
+        self.pose_translation = np.zeros((3, 1), dtype=np.float64)
+        self.trajectory_x = [0.0]
+        self.trajectory_y = [0.0]
+        self.trajectory_z = [0.0]
+        self.recent_directions = deque(maxlen=DIRECTION_HISTORY)
+
+        self.points_x = []
+        self.points_y = []
+        self.points_z = []
+        self.points_colors = []
+
+        self.frame_count = 0
+        self.scatter_plot = None
+
+        self._init_plot()
+        logging.info("Initialization complete")
+
+    def _init_plot(self):
+        plt.ion()
+        # noinspection PyTypeChecker
+        self.fig = plt.figure(figsize=(10.0, 7.0))
+        self.ax = self.fig.add_subplot(111, projection="3d")
+
+        self.path_plot, = self.ax.plot(
+            [], [], [], color="red", linewidth=2,
+            marker="o", markersize=3, label="Camera Path",
+        )
+        self.ax.set_title("3D Reconstructed Environment")
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.set_zlabel("Z")
+        self.ax.legend()
+
+    # ------------------------------------------------------------------
+    # Feature matching
+    # ------------------------------------------------------------------
+
+    def extract_features_and_colors(self, img1, img2, original_bgr):
+        kp1, des1 = self.orb.detectAndCompute(img1, None)
+        kp2, des2 = self.orb.detectAndCompute(img2, None)
+
+        if des1 is None or des2 is None or len(des1) < 20 or len(des2) < 20:
+            logging.warning("Not enough descriptors to match.")
+            return None, None, None
+
+        try:
+            matches = self.matcher.knnMatch(des1, des2, k=2)
+        except cv2.error:
+            logging.exception("Matching failed.")
+            return None, None, None
+
+        height, width = original_bgr.shape[:2]
+        good_pts1, good_pts2, colors = [], [], []
+
+        for pair in matches:
+            if len(pair) != 2:
+                continue
+            m, n = pair
+
+            if m.distance >= 0.85 * n.distance:  # Lowe ratio test
+                continue
+            if m.distance > 60:                  # absolute distance cutoff
+                continue
+
+            pt1 = kp1[m.queryIdx].pt
+            pt2 = kp2[m.trainIdx].pt
+            x, y = int(round(pt2[0])), int(round(pt2[1]))
+
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+
+            b, g, r = original_bgr[y, x]
+            colors.append([r / 255.0, g / 255.0, b / 255.0])
+            good_pts1.append(pt1)
+            good_pts2.append(pt2)
+
+        if len(good_pts1) < 8:
+            logging.info("Too few good matches.")
+            return None, None, None
+
+        logging.info(
+            f"Features: {len(kp1)} -> {len(kp2)}  Good matches: {len(good_pts1)}"
+        )
+        return (
+            np.asarray(good_pts1, dtype=np.float64),
+            np.asarray(good_pts2, dtype=np.float64),
+            np.asarray(colors, dtype=np.float64),
+        )
+
+    # ------------------------------------------------------------------
+    # Pose estimation
+    # ------------------------------------------------------------------
+
+    def _estimate_relative_pose(self, pts1, pts2):
+        """Returns (rotation, translation, inlier_mask) or (None, None, None)."""
+        essential_mat, mask = cv2.findEssentialMat(
+            pts1, pts2, self.K, method=cv2.RANSAC, prob=0.999,
+            threshold=RANSAC_THRESHOLD
+        )
+        if essential_mat is None:
+            return None, None, None
+
+        _, rotation, translation, pose_mask = cv2.recoverPose(
+            essential_mat, pts1, pts2, self.K, mask=mask
+        )
+        inliers = pose_mask.ravel() > 0
+        return rotation, translation, inliers
+
+    def _direction_is_consistent(self, step_world):
+        """Compares a candidate world-frame step against the recent heading.
+
+        Returns (accepted, unit_direction). The very first accepted step
+        always passes, since there's no trend yet to compare against.
+        """
+        norm = np.linalg.norm(step_world)
+        if norm < 1e-9:
+            return False, None
+
+        direction = (step_world / norm).ravel()
+
+        if len(self.recent_directions) == 0:
+            return True, direction
+
+        mean_dir = np.mean(self.recent_directions, axis=0)
+        mean_norm = np.linalg.norm(mean_dir)
+        if mean_norm < 1e-9:
+            return True, direction
+
+        cos_sim = float(np.dot(direction, mean_dir / mean_norm))
+        return cos_sim >= MAX_DIRECTION_CHANGE_COS, direction
+
+    def _apply_pose_update(self, rotation, translation):
+        old_rotation = self.pose_rotation.copy()
+        old_translation = self.pose_translation.copy()
+
+        self.pose_translation = self.pose_translation + self.pose_rotation @ translation
+        self.pose_rotation = self.pose_rotation @ rotation
+
+        tx, ty, tz = self.pose_translation.ravel()
+        self.trajectory_x.append(float(tx))
+        self.trajectory_y.append(float(ty))
+        self.trajectory_z.append(float(tz))
+        return old_rotation, old_translation
+
+    def _triangulate_and_store(self, old_rotation, old_translation, pts1, pts2, colors, inliers):
+        pts_old, pts_new = pts1[inliers], pts2[inliers]
+        valid_colors = colors[inliers]
+
+        proj1 = self.K @ np.hstack((old_rotation, old_translation))
+        proj2 = self.K @ np.hstack((self.pose_rotation, self.pose_translation))
+
+        points_4d = cv2.triangulatePoints(proj1, proj2, pts_old.T, pts_new.T)
+        points_3d = points_4d[:3] / points_4d[3]
+
+        for i in range(points_3d.shape[1]):
+            x, y, z = points_3d[:, i]
+            if abs(x) < 50 and abs(y) < 50 and abs(z) < 50:
+                self.points_x.append(x)
+                self.points_y.append(y)
+                self.points_z.append(z)
+                self.points_colors.append(valid_colors[i])
+
+        if len(self.points_x) > MAX_POINTS:
+            self.points_x = self.points_x[-MAX_POINTS:]
+            self.points_y = self.points_y[-MAX_POINTS:]
+            self.points_z = self.points_z[-MAX_POINTS:]
+            self.points_colors = self.points_colors[-MAX_POINTS:]
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+
+    def update_plot(self):
+        try:
+            self.path_plot.set_data(
+                np.asarray(self.trajectory_x), np.asarray(self.trajectory_y)
+            )
+            # noinspection PyUnresolvedReferences
+            self.path_plot.set_3d_properties(np.asarray(self.trajectory_z))
+
+            if self.points_x:
+                step = max(1, len(self.points_x) // 2500)
+                xs = np.asarray(self.points_x[::step])
+                ys = np.asarray(self.points_y[::step])
+                zs = np.asarray(self.points_z[::step])
+                colors = np.asarray(self.points_colors[::step])
+
+                if self.scatter_plot is None:
+                    self.scatter_plot = self.ax.scatter(
+                        xs, ys, zs, c=colors, s=3, alpha=0.8
+                    )
+                else:
+                    self.scatter_plot._offsets3d = (xs, ys, zs)
+                    self.scatter_plot.set_facecolors(colors)
+
+            all_x = self.trajectory_x + self.points_x
+            all_y = self.trajectory_y + self.points_y
+            all_z = self.trajectory_z + self.points_z
+
+            if all_x:
+                margin = 2.0
+                self.ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
+                self.ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+                self.ax.set_zlim(min(all_z) - margin, max(all_z) + margin)
+
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+
+        # Catches: bad array shapes feeding set_data/scatter (ValueError),
+        # matplotlib/Tk backend hiccups (RuntimeError), and the very common
+        # case of the plot window being closed mid-update (TclError).
+        except (ValueError, RuntimeError, TclError):
+            logging.exception("Plot update failed.")
+
+    # ------------------------------------------------------------------
+    # Camera
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_camera():
+        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            camera = cv2.VideoCapture(0, backend)
+            if camera.isOpened():
+                logging.info(f"Camera opened using backend {backend}")
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                return camera
+            camera.release()
+        return None
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self):
+        logging.info("Starting camera.")
+        camera = self._open_camera()
+        if camera is None:
+            logging.error("Camera unavailable.")
+            return
+
+        time.sleep(1)  # allow exposure to stabilize
+        ret, first_frame = camera.read()
+        if not ret:
+            logging.error("Initial frame failed.")
+            camera.release()
+            return
+
+        keyframe_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+
+        actual_h, actual_w = first_frame.shape[:2]
+        logging.info(f"Actual captured frame size: {actual_w}x{actual_h}")
+        if (actual_w, actual_h) != (640, 480):
+            print(
+                f"WARNING: camera is actually capturing at {actual_w}x{actual_h}, "
+                f"but self.K assumes 640x480. Pose estimates will be biased until "
+                f"K's cx, cy (and possibly fx, fy) are updated to match."
+            )
+
+        print("\n==============================")
+        print(" SLAM ACTIVE ")
+        print("==============================")
+        print("Translate the camera (move sideways/forward/back) - ")
+        print("rotating it in place alone won't move the reconstruction.")
+        print("Press Q in the camera window to stop.")
+
+        while True:
+            try:
+                ret, frame = camera.read()
+                if not ret:
+                    logging.warning("Frame capture failed.")
+                    continue
+
+                self.frame_count += 1
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                pts1, pts2, colors = self.extract_features_and_colors(
+                    keyframe_gray, gray, frame
+                )
+
+                status = "no match"
+                if pts1 is not None:
+                    motion = np.median(np.linalg.norm(pts2 - pts1, axis=1))
+                    status = f"motion={motion:.1f}"
+
+                    if motion > MOTION_THRESHOLD:
+                        rotation, translation, inliers = self._estimate_relative_pose(pts1, pts2)
+
+                        if inliers is not None and inliers.sum() > MIN_INLIERS:
+                            # recoverPose only gives a unit-length direction -
+                            # monocular vision can't recover true scale from
+                            # one frame pair. Scale it by the observed pixel
+                            # motion so steps are proportional to how much
+                            # the camera actually appeared to move, instead
+                            # of every accepted step jumping by a fixed size.
+                            scale = motion / self.K[0, 0]
+                            scaled_translation = translation * scale
+
+                            candidate_step = self.pose_rotation @ scaled_translation
+                            direction_ok, direction = self._direction_is_consistent(candidate_step)
+
+                            if direction_ok:
+                                old_rotation, old_translation = self._apply_pose_update(
+                                    rotation, scaled_translation
+                                )
+                                self.recent_directions.append(direction)
+                                self._triangulate_and_store(
+                                    old_rotation, old_translation, pts1, pts2, colors, inliers
+                                )
+                                keyframe_gray = gray.copy()
+                                status += f" | pose updated, inliers={inliers.sum()}"
+                                logging.info(
+                                    f"Pose {self.pose_translation.ravel().tolist()} "
+                                    f"Inliers {inliers.sum()}"
+                                )
+                            else:
+                                status += (
+                                    f" | pose rejected (direction), "
+                                    f"inliers={inliers.sum()}"
+                                )
+                        else:
+                            n_inliers = int(inliers.sum()) if inliers is not None else 0
+                            status += f" | pose rejected, inliers={n_inliers}"
+
+                # Draw tracked points + status directly on the frame instead
+                # of printing every value to the console (much cheaper, and
+                # keeps the terminal readable).
+                display = frame.copy()
+                if pts2 is not None:
+                    for p in pts2:
+                        cv2.circle(display, (int(p[0]), int(p[1])), 2, (0, 255, 255), -1)
+
+                cv2.putText(display, status, (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(display, f"Points: {len(self.points_x)}", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                cv2.imshow("SLAM Tracking", display)
+
+                if self.frame_count % RENDER_INTERVAL == 0:
+                    self.update_plot()
+
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+
+            # Catches: OpenCV rejecting bad frame/array data (cv2.error) and
+            # numpy shape mismatches during pose math (ValueError). Anything
+            # else is a real bug and should crash with a full traceback
+            # rather than being silently logged and skipped.
+            except (cv2.error, ValueError):
+                logging.exception("SLAM loop failure")
+
+        camera.release()
+        cv2.destroyAllWindows()
+        plt.close("all")
+        logging.info("SLAM stopped.")
+
+
+if __name__ == "__main__":
+    slam = WorkingEnvironmentSLAM()
+    slam.run()
